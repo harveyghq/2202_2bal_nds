@@ -25,7 +25,7 @@ class ShortestForward(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(ShortestForward, self).__init__(*args, **kwargs)
         self.network_awareness = kwargs['network_awareness']
-        self.weight = 'hop'
+        self.weight = 'delay'
         self.mac_to_port = {}
         self.mac_ip_inport = {}
         self.sw = {}
