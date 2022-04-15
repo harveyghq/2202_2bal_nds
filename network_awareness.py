@@ -9,17 +9,16 @@ from ryu.lib.packet import ethernet, arp
 from ryu.lib import hub
 from ryu.topology import event
 from ryu.topology.api import get_host, get_link, get_switch
-from ryu.topology.switches import LLDPPacket
 
 import networkx as nx
 import copy
 import time
-
+import threading
 
 GET_TOPOLOGY_INTERVAL = 2
 SEND_ECHO_REQUEST_INTERVAL = .05
 GET_DELAY_INTERVAL = 2
-
+CALC_DELAY_INTERVAL = 3
 
 class NetworkAwareness(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -27,20 +26,23 @@ class NetworkAwareness(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(NetworkAwareness, self).__init__(*args, **kwargs)
         self.switch_info = {}  # dpid: datapath
-        self.link_info = {}  # (s1, s2): s1.port
-        self.port_link={} # s1,port:s1,s2
+        self.link_info = {}  # (s1, s2): s1.port   (s1, host_ip): s1.port
+        self.port_link = {} # (s1, port): (s1, s2)
         self.port_info = {}  # dpid: (ports linked hosts)
+        self.switches = None
+
+        self.topo_map_sem = threading.Semaphore()
         self.topo_map = nx.Graph()
         self.topo_thread = hub.spawn(self._get_topology)
         self.echo_thread = hub.spawn(self._send_echo_request)
+        self.calc_thread = hub.spawn(self.calc_delay)
         
-        self.switches = None
-        self.echo_send_timestamp = {}
-        self.echo_delay = {}
+        self.echo_send_timestamp = {} # dpid: send_timestamp
+        self.echo_delay = {} # dpid: echo_delay
+        self.lldp_delay = {} # (s1, s2): lldp_delay from s1 to s2
+        self.delay = {} # (src_dpid, dst_dpid): time
         
-        self.lldp_delay = {}
-        
-        self.weight = 'hop'
+        self.weight = 'delay'
 
     def add_flow(self, datapath, priority, match, actions):
         dp = datapath
@@ -49,6 +51,16 @@ class NetworkAwareness(app_manager.RyuApp):
 
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=dp, priority=priority, match=match, instructions=inst)
+        dp.send_msg(mod)
+
+    def delete_flow(self, datapath, out_port, match):
+        dp = datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+
+        mod = parser.OFPFlowMod(datapath=dp, command=ofp.OFPFC_DELETE,
+                                out_port=out_port, out_group=ofp.OFPG_ANY,
+                                match=match)
         dp.send_msg(mod)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -73,20 +85,35 @@ class NetworkAwareness(app_manager.RyuApp):
         if ev.state == DEAD_DISPATCHER:
             del self.switch_info[dpid]
 
-    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
-    def packet_in_handler(self, ev):
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def port_status_handler(self, ev):
         msg = ev.msg
-        dpid = msg.datapath.id
-        try:
-            src_dpid, src_port_no = LLDPPacket.lldp_parse(msg.data)
-            if self.switches is None:
-                self.switches = lookup_service_brick('switches')
-            for port in self.switches.ports.keys():
-                if src_dpid == port.dpid and src_port_no == port.port_no:
-                    self.lldp_delay[(src_dpid, dpid)] = self.switches.ports[port].delay
-                    # self.logger.info("lldp_delay[(%s, %s)] = %sms", src_dpid, dpid, self.switches.ports[port].delay * 1000)
-        except:
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        if msg.reason in [ofproto.OFPPR_ADD, ofproto.OFPPR_MODIFY]:
+            datapath.ports[msg.desc.port_no] = msg.desc
+        elif msg.reason == ofproto.OFPPR_DELETE:
+            datapath.ports.pop(msg.desc.port_no, None)
+        else:
             return
+
+        if msg.desc.state == ofproto.OFPPS_LINK_DOWN:
+            self.logger.info("%s.%s: MODIFY(LINK_DOWN)", datapath.id, msg.desc.port_no)
+            if (datapath.id, msg.desc.port_no) in self.port_link:
+                switch_link = self.port_link[(datapath.id, msg.desc.port_no)] # (s1, s2)
+                if switch_link in self.lldp_delay:
+                    self.logger.info("lldp_delay (%s) deleted", switch_link)
+                    del self.lldp_delay[switch_link]
+        elif msg.desc.state == ofproto.OFPPS_LIVE:
+            self.logger.info("%s.%s: MODIFY(LIVE)", datapath.id, msg.desc.port_no)
+        
+        match = parser.OFPMatch()
+        self.delete_flow(datapath, ofproto.OFPP_ANY, match)
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        self.add_flow(datapath, 0, match, actions)
+
     
     @set_ev_cls(ofp_event.EventOFPEchoReply,
                     [HANDSHAKE_DISPATCHER, CONFIG_DISPATCHER, MAIN_DISPATCHER])
@@ -119,6 +146,9 @@ class NetworkAwareness(app_manager.RyuApp):
             if [str(x) for x in hosts] == _hosts and [str(x) for x in switches] == _switches and [str(x) for x in links] == _links:
                 continue
             _hosts, _switches, _links = [str(x) for x in hosts], [str(x) for x in switches], [str(x) for x in links]
+            
+            self.topo_map_sem.acquire()
+            self.logger.info("_get_topology lock acquired")
             self.topo_map = nx.Graph() # clear old topo map
 
             for switch in switches:
@@ -138,7 +168,7 @@ class NetworkAwareness(app_manager.RyuApp):
                 self.port_info[link.dst.dpid].discard(link.dst.port_no)
 
                 # s1 -> s2: s1.port, s2 -> s1: s2.port
-                self.port_link[(link.src.dpid,link.src.port_no)]=(link.src.dpid, link.dst.dpid)
+                self.port_link[(link.src.dpid,link.src.port_no)] = (link.src.dpid, link.dst.dpid)
                 self.port_link[(link.dst.dpid,link.dst.port_no)] = (link.dst.dpid, link.src.dpid)
 
                 self.link_info[(link.src.dpid, link.dst.dpid)] = link.src.port_no
@@ -150,9 +180,9 @@ class NetworkAwareness(app_manager.RyuApp):
                     delay /= 2
                     if(delay < 0):
                         delay = 0
-    
+
                     self.topo_map.add_edge(link.src.dpid, link.dst.dpid, hop=1, delay=delay, is_host=False)
-    
+
                 except:
                     self.logger.warn("calc s%s<->s%s delay fail(%s %s %s %s)", link.src.dpid, link.dst.dpid, self.lldp_delay.has_key((link.src.dpid, link.dst.dpid)), self.lldp_delay.has_key((link.dst.dpid, link.src.dpid)) \
                         , self.echo_delay.has_key(link.src.dpid), self.echo_delay.has_key(link.dst.dpid))
@@ -160,7 +190,35 @@ class NetworkAwareness(app_manager.RyuApp):
 
             if self.weight == 'hop':
                 self.show_topo_map()
+            self.logger.info("_get_topology lock released")
+            self.topo_map_sem.release()
             hub.sleep(GET_TOPOLOGY_INTERVAL)
+    
+    def calc_delay(self):
+        while True:
+            self.topo_map_sem.acquire()
+            self.logger.info("calc_delay lock acquired")
+            self.delay = {}
+            for src_dpid, dst_dpid in self.port_link.values():
+                try:
+                    delay  = self.lldp_delay[(src_dpid, dst_dpid)] + self.lldp_delay[(dst_dpid, src_dpid)]
+                    delay -= self.echo_delay[src_dpid] - self.echo_delay[dst_dpid]
+                    delay /= 2
+                    if(delay < 0):
+                        delay = 0
+
+                    self.delay[(src_dpid, dst_dpid)] = delay
+                    self.delay[(dst_dpid, src_dpid)] = delay
+
+                    self.topo_map.add_edge(src_dpid, dst_dpid, hop=1, delay=delay, is_host=False)
+
+                except:
+                    pass
+            for key, value in sorted(self.delay.items()):
+                self.logger.info("%s %sms", key, str(value*1000)[:4])
+            self.logger.info("calc_delay lock released")
+            self.topo_map_sem.release()
+            hub.sleep(CALC_DELAY_INTERVAL)
 
     def shortest_path(self, src, dst, weight='hop'):
         try:

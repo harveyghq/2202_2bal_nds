@@ -8,6 +8,8 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet, arp, ipv4
 from ryu.controller import ofp_event
+from ryu.lib.packet import ether_types
+from ryu.topology.switches import LLDPPacket
 from ryu.topology import event
 import sys
 from network_awareness import NetworkAwareness
@@ -68,12 +70,28 @@ class ShortestForward(app_manager.RyuApp):
         dst_mac = eth_pkt.dst
         src_mac = eth_pkt.src
 
+        if pkt_type == ether_types.ETH_TYPE_LLDP:
+            self.handle_lldp(msg)
+            return
 
         if isinstance(arp_pkt, arp.arp):
             self.handle_arp(msg, in_port, dst_mac, src_mac, pkt, pkt_type)
 
         if isinstance(ipv4_pkt, ipv4.ipv4):
             self.handle_ipv4(msg, ipv4_pkt.src, ipv4_pkt.dst, pkt_type)
+    
+    def handle_lldp(self, msg):
+        dpid = msg.datapath.id
+        try:
+            src_dpid, src_port_no = LLDPPacket.lldp_parse(msg.data)
+            if self.network_awareness.switches is None:
+                self.network_awareness.switches = lookup_service_brick('switches')
+            for port in self.network_awareness.switches.ports.keys():
+                if src_dpid == port.dpid and src_port_no == port.port_no:
+                    self.network_awareness.lldp_delay[(src_dpid, dpid)] = self.network_awareness.switches.ports[port].delay
+                    # self.logger.info("lldp_delay[(%s, %s)] = %sms", src_dpid, dpid, self.network_awareness.switches.ports[port].delay * 1000)
+        except:
+            return
 
     def handle_arp(self, msg, in_port, dst, src, pkt, pkt_type):
         dp = msg.datapath
@@ -102,8 +120,10 @@ class ShortestForward(app_manager.RyuApp):
             dst_port = self.mac_to_port[dpid][dst]
             
             # add flow table
-            self.send_flow_mod(parser, dpid, pkt_type, src_ip, dst_ip, in_port, dst_port)
-            
+            match = parser.OFPMatch(in_port=in_port, eth_type=pkt_type, eth_dst=dst)
+            actions = [parser.OFPActionOutput(dst_port)]
+            self.add_flow(dp, 1, match, actions, 10, 30)
+
             # send packet-out
             actions = [parser.OFPActionOutput(dst_port)]
             out = parser.OFPPacketOut(
@@ -111,7 +131,7 @@ class ShortestForward(app_manager.RyuApp):
                 in_port=msg.match['in_port'],actions=actions, data=msg.data)
             dp.send_msg(out)
 
-            self.logger.info('%s: packet: %s to %s from port %s to port %s', dpid, src, dst, in_port, dst_port)
+            # self.logger.info('%s: packet: %s to %s from port %s to port %s', dpid, src, dst, in_port, dst_port)
         else:
             # have to flood
             actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
@@ -120,7 +140,7 @@ class ShortestForward(app_manager.RyuApp):
                 in_port=msg.match['in_port'],actions=actions, data=msg.data)
             dp.send_msg(out)
         
-            self.logger.info('%s: packet: %s to %s from port %s to port ? (flooded)', dpid, src, dst, in_port)
+            # self.logger.info('%s: packet: %s to %s from port %s to port ? (flooded)', dpid, src, dst, in_port)
 
 
     def handle_ipv4(self, msg, src_ip, dst_ip, pkt_type):
@@ -162,7 +182,7 @@ class ShortestForward(app_manager.RyuApp):
         match = parser.OFPMatch(
             in_port=in_port, eth_type=pkt_type, ipv4_src=src_ip, ipv4_dst=dst_ip)
         actions = [parser.OFPActionOutput(out_port)]
-        self.add_flow(dp, 1, match, actions, 10, 30)
+        self.add_flow(dp, 1, match, actions, 15, 30)
 
     def show_path(self, src, dst, port_path):
         self.logger.info('path: {} -> {}'.format(src, dst))
