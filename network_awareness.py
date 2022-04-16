@@ -207,8 +207,7 @@ class NetworkAwareness(app_manager.RyuApp):
                     if(delay < 0):
                         delay = 0
 
-                    self.delay[(src_dpid, dst_dpid)] = delay
-                    self.delay[(dst_dpid, src_dpid)] = delay
+                    self.delay[(src_dpid, dst_dpid)] = delay # (src, dst) delay may vary from (dst, src) delay
 
                     self.topo_map.add_edge(src_dpid, dst_dpid, hop=1, delay=delay, is_host=False)
 

@@ -83,11 +83,11 @@ class ShortestForward(app_manager.RyuApp):
     def handle_lldp(self, msg):
         dpid = msg.datapath.id
         try:
-            src_dpid, src_port_no = LLDPPacket.lldp_parse(msg.data)
+            src_dpid, src_addr = LLDPPacket.lldp_parse(msg.data)
             if self.network_awareness.switches is None:
                 self.network_awareness.switches = lookup_service_brick('switches')
             for port in self.network_awareness.switches.ports.keys():
-                if src_dpid == port.dpid and src_port_no == port.port_no:
+                if src_dpid == port.dpid and src_addr == port.hw_addr:
                     self.network_awareness.lldp_delay[(src_dpid, dpid)] = self.network_awareness.switches.ports[port].delay
                     # self.logger.info("lldp_delay[(%s, %s)] = %sms", src_dpid, dpid, self.network_awareness.switches.ports[port].delay * 1000)
         except:
