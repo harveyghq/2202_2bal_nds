@@ -241,6 +241,119 @@ class PortState(dict):
     def modify(self, port_no, port):
         self[port_no] = port
 
+class SwitchData(object):
+    def __init__(self, lldp_data):
+        super(SwitchData, self).__init__()
+        self.lldp_data = lldp_data
+        self.timestamp = None
+        self.sent = 0
+        self.delay = 0
+
+    def lldp_sent(self):
+        self.timestamp = time.time()
+        self.sent += 1
+
+    def lldp_received(self):
+        self.sent = 0
+
+    def lldp_dropped(self):
+        return self.sent
+
+    def clear_timestamp(self):
+        self.timestamp = None
+
+    def __str__(self):
+        return 'SwitchData<timestamp=%s, sent=%d>' \
+            % (self.timestamp, self.sent)
+
+class SwitchDataState(dict):
+    # dict: Switch class -> SwitchData class
+    # slimed down version of OrderedDict as python 2.6 doesn't support it.
+    _PREV = 0
+    _NEXT = 1
+    _KEY = 2
+
+    def __init__(self):
+        super(SwitchDataState, self).__init__()
+        self._root = root = []  # sentinel node
+        root[:] = [root, root, None]  # [_PREV, _NEXT, _KEY] doubly linked list
+        self._map = {}
+
+    def _remove_key(self, key):
+        link_prev, link_next, key = self._map.pop(key)
+        link_prev[self._NEXT] = link_next
+        link_next[self._PREV] = link_prev
+
+    def _append_key(self, key):
+        root = self._root
+        last = root[self._PREV]
+        last[self._NEXT] = root[self._PREV] = self._map[key] = [last, root,
+                                                                key]
+
+    def _prepend_key(self, key):
+        root = self._root
+        first = root[self._NEXT]
+        first[self._PREV] = root[self._NEXT] = self._map[key] = [root, first,
+                                                                 key]
+
+    def _move_last_key(self, key):
+        self._remove_key(key)
+        self._append_key(key)
+
+    def _move_front_key(self, key):
+        self._remove_key(key)
+        self._prepend_key(key)
+
+    def add_sw(self, sw, lldp_data):
+        if sw not in self:
+            self._prepend_key(sw)
+            self[sw] = SwitchData(lldp_data)
+
+    def lldp_sent(self, sw):
+        switch_data = self[sw]
+        switch_data.lldp_sent()
+        self._move_last_key(sw)
+        return switch_data
+
+    def lldp_received(self, sw):
+        self[sw].lldp_received()
+
+    def move_front(self, sw):
+        switch_data = self.get(sw, None)
+        if switch_data is not None:
+            switch_data.clear_timestamp()
+            self._move_front_key(sw)
+
+    def get_sw(self, sw):
+        return self[sw]
+
+    def del_sw(self, sw):
+        del self[sw]
+        self._remove_key(sw)
+
+    def __iter__(self):
+        root = self._root
+        curr = root[self._NEXT]
+        while curr is not root:
+            yield curr[self._KEY]
+            curr = curr[self._NEXT]
+
+    def clear(self):
+        for node in self._map.values():
+            del node[:]
+        root = self._root
+        root[:] = [root, root, None]
+        self._map.clear()
+        dict.clear(self)
+
+    def items(self):
+        'od.items() -> list of (key, value) pairs in od'
+        return [(key, self[key]) for key in self]
+
+    def iteritems(self):
+        'od.iteritems -> an iterator over the (key, value) pairs in od'
+        for k in self:
+            yield (k, self[k])
 
 class PortData(object):
     def __init__(self, is_down, lldp_data):
@@ -481,6 +594,7 @@ class LLDPPacket(object):
                 msg='unknown chassis id format %s' % chassis_id)
         src_dpid = str_to_dpid(chassis_id[LLDPPacket.CHASSIS_ID_PREFIX_LEN:])
 
+        '''
         tlv_port_id = lldp_pkt.tlvs[1]
         if tlv_port_id.subtype != lldp.PortID.SUB_PORT_COMPONENT:
             raise LLDPPacket.LLDPUnknownFormat(
@@ -490,8 +604,9 @@ class LLDPPacket(object):
             raise LLDPPacket.LLDPUnknownFormat(
                 msg='unknown port id %d' % port_id)
         (src_port_no, ) = struct.unpack(LLDPPacket.PORT_ID_STR, port_id)
+        '''
 
-        return src_dpid, src_port_no
+        return src_dpid, eth_pkt.src
 
 
 class Switches(app_manager.RyuApp):
@@ -509,6 +624,7 @@ class Switches(app_manager.RyuApp):
 
     LLDP_SEND_GUARD = .05
     LLDP_SEND_PERIOD_PER_PORT = .9
+    LLDP_SEND_PERIOD_PER_SWITCH = 4.
     TIMEOUT_CHECK_PERIOD = 5.
     LINK_TIMEOUT = TIMEOUT_CHECK_PERIOD * 2
     LINK_LLDP_DROP = 5
@@ -519,6 +635,7 @@ class Switches(app_manager.RyuApp):
         self.name = 'switches'
         self.dps = {}                 # datapath_id => Datapath class
         self.port_state = {}          # datapath_id => ports
+        self.sw = SwitchDataState()  # Switch class -> SwitchData class
         self.ports = PortDataState()  # Port class -> PortData class
         self.links = LinkState()      # Link class -> timestamp
         self.hosts = HostState()      # mac address -> Host class list
@@ -530,7 +647,8 @@ class Switches(app_manager.RyuApp):
             self.explicit_drop = self.CONF.explicit_drop
             self.lldp_event = hub.Event()
             self.link_event = hub.Event()
-            self.threads.append(hub.spawn(self.lldp_loop))
+            # self.threads.append(hub.spawn(self.lldp_loop))
+            self.threads.append(hub.spawn(self.lldp_loop_switch))
             self.threads.append(hub.spawn(self.link_loop))
 
     def close(self):
@@ -575,6 +693,11 @@ class Switches(app_manager.RyuApp):
         self.ports.add_port(port, lldp_data)
         # LOG.debug('_port_added dpid=%s, port_no=%s, live=%s',
         #           port.dpid, port.port_no, port.is_live())
+
+    def _sw_added(self, sw):
+        lldp_data = LLDPPacket.lldp_packet(
+            sw.dp.id, 0, '00:00:00:00:00:00', self.DEFAULT_TTL)
+        self.sw.add_sw(sw, lldp_data)
 
     def _link_down(self, port):
         try:
@@ -666,6 +789,7 @@ class Switches(app_manager.RyuApp):
                 for port in switch.ports:
                     if not port.is_reserved():
                         self._port_added(port)
+                self._sw_added(switch)
 
             self.lldp_event.set()
 
@@ -768,24 +892,34 @@ class Switches(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def lldp_packet_in_handler(self, ev):
+        # add receive timestamp
+        recv_timestamp = time.time()
+
         if not self.link_discovery:
             return
 
         msg = ev.msg
         try:
-            src_dpid, src_port_no = LLDPPacket.lldp_parse(msg.data)
+            src_dpid, src_mac = LLDPPacket.lldp_parse(msg.data)
+            send_timestamp = None
+            for sw, sw_data in self.sw.items():
+                if sw.dp.id == src_dpid:
+                    send_timestamp = sw_data.timestamp
+                    break
         except LLDPPacket.LLDPUnknownFormat:
             # This handler can receive all the packets which can be
             # not-LLDP packet. Ignore it silently
             return
         
-        # calc the delay of the pkt
-        recv_timestamp = time.time()
+        # calc the delay of the lldp packet
+        src_port_no = None
         for port, port_data in self.ports.items():
-            if src_dpid == port.dpid and src_port_no == port.port_no:
-                send_timestamp = port_data.timestamp
+            if src_dpid == port.dpid and src_mac == port.hw_addr:
+                src_port_no = port.port_no
                 if send_timestamp:
                     port_data.delay = recv_timestamp - send_timestamp
+        if src_port_no is None:
+            return
 
         dst_dpid = msg.datapath.id
         if msg.datapath.ofproto.OFP_VERSION == ofproto_v1_0.OFP_VERSION:
@@ -898,6 +1032,68 @@ class Switches(app_manager.RyuApp):
             # TODO: need to handle NDP
             ipv6_pkt, _, _ = pkt_type.parser(pkt_data)
             self.hosts.update_ip(host, ip_v6=ipv6_pkt.src)
+
+    def lldp_loop_switch(self):
+        while self.is_active:
+            self.lldp_event.clear()
+
+            now = time.time()
+            timeout = None
+            sw_now = []
+            sw = []
+            for (key, data) in self.sw.items():
+                if data.timestamp is None:
+                    sw_now.append(key)
+                    continue
+
+                expire = data.timestamp + self.LLDP_SEND_PERIOD_PER_SWITCH
+                if expire <= now:
+                    sw.append(key)
+                    continue
+
+                timeout = expire - now
+                break
+
+            for switch in sw_now:
+                self.send_switch_lldp_packet(switch)
+            for switch in sw:
+                self.send_switch_lldp_packet(switch)
+                hub.sleep(self.LLDP_SEND_GUARD)      # don't burst
+
+            if timeout is not None and sw:
+                timeout = 0     # We have already slept
+            # LOG.debug('lldp sleep %s', timeout)
+            self.lldp_event.wait(timeout=timeout)
+
+    def send_switch_lldp_packet(self, sw):
+        try:
+            switch_data = self.sw.lldp_sent(sw)
+        except KeyError:
+            return
+        
+        dp = sw.dp
+        if dp is None:
+            # datapath was already deleted
+            return
+
+        # LOG.debug('lldp sent dpid=%s, port_no=%d', dp.id, port.port_no)
+        # TODO:XXX
+        actions = []
+        for port in sw.ports:
+            actions.append(dp.ofproto_parser.OFPActionSetField(eth_src=port.hw_addr))
+            actions.append(dp.ofproto_parser.OFPActionOutput(port.port_no))
+
+        if dp.ofproto.OFP_VERSION == ofproto_v1_0.OFP_VERSION:
+            dp.send_packet_out(actions=actions, data=switch_data.lldp_data)
+        elif dp.ofproto.OFP_VERSION >= ofproto_v1_2.OFP_VERSION:
+            out = dp.ofproto_parser.OFPPacketOut(
+                datapath=dp, in_port=dp.ofproto.OFPP_CONTROLLER,
+                buffer_id=dp.ofproto.OFP_NO_BUFFER, actions=actions,
+                data=switch_data.lldp_data)
+            dp.send_msg(out)
+        else:
+            LOG.error('cannot send lldp packet. unsupported version. %x',
+                      dp.ofproto.OFP_VERSION)
 
     def send_lldp_packet(self, port):
         try:
