@@ -10,10 +10,7 @@ from ryu.lib.packet import ethernet, arp, ipv4
 from ryu.controller import ofp_event
 from ryu.lib.packet import ether_types
 from ryu.topology.switches import LLDPPacket
-from ryu.topology import event
-import sys
 from network_awareness import NetworkAwareness
-import networkx as nx
 
 ETHERNET = ethernet.ethernet.__name__
 ETHERNET_MULTICAST = "ff:ff:ff:ff:ff:ff"
@@ -31,7 +28,6 @@ class ShortestForward(app_manager.RyuApp):
         self.mac_to_port = {}
         self.mac_ip_inport = {}
         self.sw = {}
-        self.path=None
 
     def add_flow(self, datapath, priority, match, actions, idle_timeout=0, hard_timeout=0):
         dp = datapath
@@ -83,11 +79,11 @@ class ShortestForward(app_manager.RyuApp):
     def handle_lldp(self, msg):
         dpid = msg.datapath.id
         try:
-            src_dpid, src_addr = LLDPPacket.lldp_parse(msg.data)
+            src_dpid, src_port = LLDPPacket.lldp_parse(msg.data)
             if self.network_awareness.switches is None:
                 self.network_awareness.switches = lookup_service_brick('switches')
             for port in self.network_awareness.switches.ports.keys():
-                if src_dpid == port.dpid and src_addr == port.hw_addr:
+                if src_dpid == port.dpid and src_port== port.port_no:
                     self.network_awareness.lldp_delay[(src_dpid, dpid)] = self.network_awareness.switches.ports[port].delay
                     # self.logger.info("lldp_delay[(%s, %s)] = %sms", src_dpid, dpid, self.network_awareness.switches.ports[port].delay * 1000)
         except:
@@ -151,8 +147,9 @@ class ShortestForward(app_manager.RyuApp):
             return
 
 
-
-        self.path=dpid_path
+        if self.network_awareness.path is None:
+            self.network_awareness.path = []
+        self.network_awareness.path.append(dpid_path)
         # get port path:  h1 -> in_port, s1, out_port -> h2
         port_path = []
         for i in range(1, len(dpid_path) - 1):

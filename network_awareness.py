@@ -1,24 +1,19 @@
 from ryu.base import app_manager
-from ryu.base.app_manager import lookup_service_brick
 from ryu.ofproto import ofproto_v1_3
 from ryu.controller.handler import set_ev_cls
 from ryu.controller.handler import MAIN_DISPATCHER, CONFIG_DISPATCHER, DEAD_DISPATCHER, HANDSHAKE_DISPATCHER
 from ryu.controller import ofp_event
-from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet, arp
 from ryu.lib import hub
-from ryu.topology import event
 from ryu.topology.api import get_host, get_link, get_switch
 
 import networkx as nx
-import copy
 import time
 import threading
 
-GET_TOPOLOGY_INTERVAL = 2
-SEND_ECHO_REQUEST_INTERVAL = .05
-GET_DELAY_INTERVAL = 2
-CALC_DELAY_INTERVAL = 3
+GET_TOPOLOGY_INTERVAL = .5
+SEND_ECHO_REQUEST_INTERVAL = .1
+GET_DELAY_INTERVAL = .6
+CALC_DELAY_INTERVAL = 1.4
 
 class NetworkAwareness(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -30,6 +25,7 @@ class NetworkAwareness(app_manager.RyuApp):
         self.port_link = {} # (s1, port): (s1, s2)
         self.port_info = {}  # dpid: (ports linked hosts)
         self.switches = None
+        self.path = None # store all calcuated paths, used when port status changes
 
         self.topo_map_sem = threading.Semaphore()
         self.topo_map = nx.Graph()
@@ -92,27 +88,68 @@ class NetworkAwareness(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
+        affected_port = msg.desc.port_no
+
         if msg.reason in [ofproto.OFPPR_ADD, ofproto.OFPPR_MODIFY]:
-            datapath.ports[msg.desc.port_no] = msg.desc
+            datapath.ports[affected_port] = msg.desc
         elif msg.reason == ofproto.OFPPR_DELETE:
-            datapath.ports.pop(msg.desc.port_no, None)
+            datapath.ports.pop(affected_port, None)
         else:
             return
 
+        self.topo_map_sem.acquire()
         if msg.desc.state == ofproto.OFPPS_LINK_DOWN:
-            self.logger.info("%s.%s: MODIFY(LINK_DOWN)", datapath.id, msg.desc.port_no)
-            if (datapath.id, msg.desc.port_no) in self.port_link:
-                switch_link = self.port_link[(datapath.id, msg.desc.port_no)] # (s1, s2)
+            # need to delete all flow tables along the path
+            self.logger.info("%s.%s: MODIFY(LINK_DOWN)", datapath.id, affected_port)
+            if (datapath.id, affected_port) in self.port_link:
+                switch_link = self.port_link[(datapath.id, affected_port)] # (s1, s2)
                 if switch_link in self.lldp_delay:
                     self.logger.info("lldp_delay (%s) deleted", switch_link)
                     del self.lldp_delay[switch_link]
+
+            deleted_sw = []
+            if self.path and len(self.path) > 0:
+                new_path = []
+                for _path in self.path:
+                    need_delete = 0
+                    for i in range(1, len(_path) - 1):
+                        dpid = _path[i]
+                        # get in_port, out_port
+                        in_port = self.link_info[(_path[i], _path[i - 1])]
+                        out_port = self.link_info[(_path[i], _path[i + 1])]
+                        if dpid == datapath.id and (in_port == affected_port or out_port == affected_port):
+                            need_delete = 1
+                            break
+                    # if ports contain affected port then add all dp and delete this route
+                    if need_delete:
+                        for i in range(1, len(_path) - 1):
+                            if not _path[i] in deleted_sw:
+                                self.logger.info("s%s flow table reset", _path[i])
+                                match = parser.OFPMatch()
+                                self.delete_flow(self.switch_info[_path[i]], ofproto.OFPP_ANY, match)
+                                actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+                                self.add_flow(self.switch_info[_path[i]], 0, match, actions)
+                                deleted_sw.append(_path[i])
+                    else:
+                        new_path.append(_path)
+                self.path = new_path
         elif msg.desc.state == ofproto.OFPPS_LIVE:
-            self.logger.info("%s.%s: MODIFY(LIVE)", datapath.id, msg.desc.port_no)
-        
-        match = parser.OFPMatch()
-        self.delete_flow(datapath, ofproto.OFPP_ANY, match)
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, 0, match, actions)
+            self.logger.info("%s.%s: MODIFY(LIVE)", datapath.id, affected_port)
+            deleted_sw = []
+            if self.path and len(self.path) > 0:
+                for _path in self.path:
+                    # delete all flow tables
+                    for i in range(1, len(_path) - 1):
+                        if not _path[i] in deleted_sw:
+                            self.logger.info("s%s flow table reset", _path[i])
+                            match = parser.OFPMatch()
+                            self.delete_flow(self.switch_info[_path[i]], ofproto.OFPP_ANY, match)
+                            actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+                            self.add_flow(self.switch_info[_path[i]], 0, match, actions)
+                            deleted_sw.append(_path[i])
+                self.path = None
+
+        self.topo_map_sem.release()
 
     
     @set_ev_cls(ofp_event.EventOFPEchoReply,
@@ -144,11 +181,12 @@ class NetworkAwareness(app_manager.RyuApp):
 
             # update topo_map when topology change
             if [str(x) for x in hosts] == _hosts and [str(x) for x in switches] == _switches and [str(x) for x in links] == _links:
+                hub.sleep(GET_TOPOLOGY_INTERVAL)
                 continue
             _hosts, _switches, _links = [str(x) for x in hosts], [str(x) for x in switches], [str(x) for x in links]
             
             self.topo_map_sem.acquire()
-            self.logger.info("_get_topology lock acquired")
+            # self.logger.info("_get_topology lock acquired")
             self.topo_map = nx.Graph() # clear old topo map
 
             for switch in switches:
@@ -184,20 +222,21 @@ class NetworkAwareness(app_manager.RyuApp):
                     self.topo_map.add_edge(link.src.dpid, link.dst.dpid, hop=1, delay=delay, is_host=False)
 
                 except:
-                    self.logger.warn("calc s%s<->s%s delay fail(%s %s %s %s)", link.src.dpid, link.dst.dpid, self.lldp_delay.has_key((link.src.dpid, link.dst.dpid)), self.lldp_delay.has_key((link.dst.dpid, link.src.dpid)) \
-                        , self.echo_delay.has_key(link.src.dpid), self.echo_delay.has_key(link.dst.dpid))
+                    pass
+                    # self.logger.warn("calc s%s<->s%s delay fail(%s %s %s %s)", link.src.dpid, link.dst.dpid, self.lldp_delay.has_key((link.src.dpid, link.dst.dpid)), self.lldp_delay.has_key((link.dst.dpid, link.src.dpid)) \
+                        # , self.echo_delay.has_key(link.src.dpid), self.echo_delay.has_key(link.dst.dpid))
 
 
             if self.weight == 'hop':
                 self.show_topo_map()
-            self.logger.info("_get_topology lock released")
+            # self.logger.info("_get_topology lock released")
             self.topo_map_sem.release()
             hub.sleep(GET_TOPOLOGY_INTERVAL)
     
     def calc_delay(self):
         while True:
             self.topo_map_sem.acquire()
-            self.logger.info("calc_delay lock acquired")
+            # self.logger.info("calc_delay lock acquired")
             self.delay = {}
             for src_dpid, dst_dpid in self.port_link.values():
                 try:
@@ -213,9 +252,9 @@ class NetworkAwareness(app_manager.RyuApp):
 
                 except:
                     pass
-            for key, value in sorted(self.delay.items()):
-                self.logger.info("%s %sms", key, str(value*1000)[:4])
-            self.logger.info("calc_delay lock released")
+            # for key, value in sorted(self.delay.items()):
+            #     self.logger.info("%s %sms", key, str(value*1000)[:4])
+            # self.logger.info("calc_delay lock released")
             self.topo_map_sem.release()
             hub.sleep(CALC_DELAY_INTERVAL)
 
